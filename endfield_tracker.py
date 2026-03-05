@@ -99,7 +99,8 @@ def fetch_and_save_all_records(url, csv_filename="endfield_gacha_history_all.csv
         {"name": "기초 헤드헌팅", "api": "https://ef-webview.gryphline.com/api/record/char", "pool_type": "E_CharacterGachaPoolType_Standard"},
         {"name": "특별 허가 헤드헌팅", "api": "https://ef-webview.gryphline.com/api/record/char", "pool_type": "E_CharacterGachaPoolType_Special"},
         {"name": "여정의 시작 헤드헌팅", "api": "https://ef-webview.gryphline.com/api/record/char", "pool_type": "E_CharacterGachaPoolType_Beginner"},
-        {"name": "무기 가챠", "api": "https://ef-webview.gryphline.com/api/record/weapon", "pool_type": "E_WeaponGachaPoolType_Standard"} 
+        {"name": "표준 무기고", "api": "https://ef-webview.gryphline.com/api/record/weapon", "pool_type": "E_WeaponGachaPoolType_Standard"},
+        {"name": "한정 무기고", "api": "https://ef-webview.gryphline.com/api/record/weapon", "pool_type": "E_WeaponGachaPoolType_Special"}
     ]
 
     all_records = []
@@ -111,8 +112,10 @@ def fetch_and_save_all_records(url, csv_filename="endfield_gacha_history_all.csv
         pool_count = 0
         
         while has_more:
-            params = {"server_id": 2, "pool_type": pool["pool_type"], "lang": "ko-kr", "token": token}
-            if seq_id: params["seq_id"] = seq_id
+            server_id = query_params.get('server_id', ['2'])[0]
+            params = {"server_id": server_id, "pool_type": pool["pool_type"], "lang": "ko-kr", "token": token}
+            if seq_id:
+                params["seq_id"] = seq_id
 
             query_string = urlencode(params)
             full_url = f"{pool['api']}?{query_string}"
@@ -158,6 +161,17 @@ def fetch_and_save_all_records(url, csv_filename="endfield_gacha_history_all.csv
         time.sleep(0.1)
 
     if all_records:
+        seen_seq = set()
+        deduped = []
+        for record in all_records:
+            sid = record.get('seqId')
+            # weaponId 유무로 타입 구분 후 복합 키 생성
+            record_type = 'weap' if record.get('weaponId') else 'char'
+            key = (record_type, sid)
+            if key not in seen_seq:
+                seen_seq.add(key)
+                deduped.append(record)
+        all_records = deduped
         with open(csv_filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
             all_keys = []
             for record in all_records:
@@ -181,7 +195,7 @@ def analyze_gacha_luck(csv_filename="endfield_gacha_history_all.csv"):
     try:
         with open(csv_filename, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
-            rows = sorted(list(reader), key=lambda x: int(x['gachaTs']))
+            rows = sorted(list(reader), key=lambda x: (int(x.get('gachaTs', 0)), int(x.get('seqId', 0))))
     except FileNotFoundError:
         print(f"❌ 오류: '{csv_filename}' 파일을 찾을 수 없습니다.")
         return
@@ -190,24 +204,56 @@ def analyze_gacha_luck(csv_filename="endfield_gacha_history_all.csv"):
         rarity = int(row['rarity'])
         name = row.get('charName') if row.get('charName') else row.get('weaponName', '이름 없음')
         pool = row.get('poolName', '')
-        
-        if row.get('weaponName'):
-            weap_pulls.append({'name': name, 'rarity': rarity, 'pool': pool})
+        is_free = row.get('isFree') == 'True'
+        if row.get('weaponId'):
+            weap_pulls.append({'name': name, 'rarity': rarity, 'pool': pool, 'is_free': is_free})
         else:
-            char_pulls.append({'name': name, 'rarity': rarity, 'pool': pool})
+            char_pulls.append({'name': name, 'rarity': rarity, 'pool': pool, 'is_free': is_free})
 
     def calc_pity(pulls_list):
         records = []
         pity = 0
         for p in pulls_list:
-            pity += 1
+            if not p.get('is_free'):   # ← 긴급모집 제외
+                pity += 1
             if p['rarity'] == 6:
                 records.append({'name': p['name'], 'pity': pity, 'pool': p['pool']})
                 pity = 0
         return records, pity
 
-    char_6stars, current_char_pity = calc_pity(char_pulls)
-    weap_6stars, current_weap_pity = calc_pity(weap_pulls)
+    from collections import defaultdict
+    char_by_pool = defaultdict(list)
+    for p in char_pulls:
+        char_by_pool[p['pool']].append(p)
+
+    # 배너별로 천장 계산
+    all_char_6stars = []
+    char_pool_results = {}
+    all_char_6stars = []
+    current_char_pity = 0
+    for pool_name, pulls in char_by_pool.items():
+        records, pity = calc_pity(pulls)          # 딱 1번만 호출
+        char_pool_results[pool_name] = {'records': records, 'pity': pity}
+        all_char_6stars.extend(records)
+        if pulls[-1] == char_pulls[-1]:
+            current_char_pity = pity
+
+    char_6stars = sorted(all_char_6stars, key=lambda x: x['pity'], reverse=False)
+    weap_by_pool = defaultdict(list)
+    for p in weap_pulls:
+        weap_by_pool[p['pool']].append(p)
+
+    weap_pool_results = {}
+    all_weap_6stars = []
+    current_weap_pity = 0
+    for pool_name, pulls in weap_by_pool.items():
+        records, pity = calc_pity(pulls)
+        weap_pool_results[pool_name] = {'records': records, 'pity': pity}
+        all_weap_6stars.extend(records)
+        if pulls[-1] == weap_pulls[-1]:
+            current_weap_pity = pity
+
+    weap_6stars = sorted(all_weap_6stars, key=lambda x: x['pity'])
 
     CHAR_RATE, WEAP_RATE = 0.016, 0.050
 
@@ -217,28 +263,44 @@ def analyze_gacha_luck(csv_filename="endfield_gacha_history_all.csv"):
     total_char = len(char_pulls)
     total_char_6 = len(char_6stars)
     if total_char > 0:
-        expected_char_6 = total_char * CHAR_RATE
-        avg_char_pity = sum(x['pity'] for x in char_6stars) / total_char_6 if total_char_6 > 0 else 0
-        char_percentile = (1 - calculate_binom_cdf(max(0, total_char_6 - 1), total_char, CHAR_RATE)) * 100
-
         print("\n" + "=" * 45)
         print("👤 캐릭터 헤드헌팅 운(Luck) 분석 결과")
         print("=" * 45)
+        expected_char_6 = total_char * CHAR_RATE
+        charluck_score = (1 - calculate_binom_cdf(max(0, total_char_6 - 1), total_char, CHAR_RATE)) * 100
+        EXCLUDE_FROM_AVG = {'여정의 시작 헤드헌팅'}
+        filtered = [x for x in all_char_6stars if x['pool'] not in EXCLUDE_FROM_AVG]
+        avg_char_pity = sum(x['pity'] for x in filtered) / len(filtered) if filtered else 0
+
+
         print(f"▶ 총 뽑기 횟수 : {total_char}회")
         print(f"▶ 6성 획득 수  : {total_char_6}명 (공식 확률상 기대치: {expected_char_6:.1f}명)")
         print(f"▶ 평균 6성 천장 : {avg_char_pity:.1f}회 (공식 평균치: 약 62.5회)")
         print(f"▶ 현재 남은 스택 : {current_char_pity} / 80")
-        print(f"▶ 상위 % 운    : 상위 {char_percentile:.1f}%")
+        print(f"▶ 상위 % 운    : 상위 {charluck_score:.1f}%")
 
-        if char_percentile < 20: eval_msg = "✨ 축복받은 비틱 계정! 압도적인 행운입니다."
-        elif char_percentile < 50: eval_msg = "👍 운이 좋은 편입니다! 남들보다 빠르게 캐릭터를 데려오고 계시네요."
-        elif char_percentile <= 70: eval_msg = "⚖️ 정확히 평균적인 운입니다. 평범한 엔드필드 생활 중이네요."
+        if charluck_score < 20: eval_msg = "✨ 축복받은 비틱 계정! 압도적인 행운입니다."
+        elif charluck_score < 50: eval_msg = "👍 운이 좋은 편입니다! 남들보다 빠르게 캐릭터를 데려오고 계시네요."
+        elif charluck_score <= 70: eval_msg = "⚖️ 정확히 평균적인 운입니다. 평범한 엔드필드 생활 중이네요."
         else: eval_msg = "😭 운이 조금 나빴네요. 천장의 요정이 자주 찾아왔습니다."
         print(f"\n[종합 평가] {eval_msg}")
 
-        print("\n--- 6성 캐릭터 획득 히스토리 ---")
-        for r in char_6stars:
-            print(f" [{r['pity']:>2}뽑] {r['name']} ({r['pool']})")
+        print("\n--- 6성 캐릭터 획득 히스토리 (배너별) ---")
+        for pool_name, result in char_pool_results.items():
+            records, pity = result['records'], result['pity']
+            total_pulls = len(char_by_pool[pool_name])
+            avg = f", 평균 {sum(r['pity'] for r in records)/len(records):.1f}회" if records else ""
+            print(f"\n  [{pool_name}], 총{total_pulls}회{avg}")
+            if records:
+                for r in records:
+                    print(f"   [{r['pity']:>2}뽑] {r['name']}")
+            else:
+                print(f"   (아직 6성 없음)")
+            BANNER_PITY_CAP = {
+                '여정의 시작 헤드헌팅': 40
+            }
+            cap = BANNER_PITY_CAP.get(pool_name, 80)
+            print(f"  └ 현재 스택: {pity} / {cap}")
 
     # ==========================================
     # 무기 헤드헌팅 분석 출력
@@ -266,9 +328,18 @@ def analyze_gacha_luck(csv_filename="endfield_gacha_history_all.csv"):
         else: eval_msg = "😭 확률의 억까를 조금 당하셨군요... 다음엔 비틱하시길!"
         print(f"\n[종합 평가] {eval_msg}")
 
-        print("\n--- 6성 무기 획득 히스토리 ---")
-        for r in weap_6stars:
-            print(f" [{r['pity']:>2}뽑] {r['name']} ({r['pool']})")
+        print("\n--- 6성 무기 획득 히스토리 (배너별) ---")
+        for pool_name, result in weap_pool_results.items():
+            records, pity = result['records'], result['pity']
+            total_pulls = len(weap_by_pool[pool_name])
+            avg = f", 평균 {sum(r['pity'] for r in records)/len(records):.1f}회" if records else ""
+            print(f"\n  [{pool_name}], 총{total_pulls}회{avg}")
+            if records:
+                for r in records:
+                    print(f"   [{r['pity']:>2}뽑] {r['name']}")
+            else:
+                print(f"   (아직 6성 없음)")
+            print(f"  └ 현재 스택: {pity} / 40")
 
     print("\n" + "=" * 45 + "\n")
 
