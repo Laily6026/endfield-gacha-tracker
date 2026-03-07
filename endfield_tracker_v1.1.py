@@ -12,7 +12,9 @@ import math
 import urllib.request
 from urllib.parse import urlparse, parse_qs, urlencode
 from urllib.error import URLError, HTTPError
+from datetime import datetime
 from pathlib import Path
+import sqlite3
 
 # CDF 직접 구현
 def calculate_binom_cdf(k, n, p):
@@ -82,7 +84,7 @@ def extract_gacha_url_from_log():
         
     return None
 
-def fetch_and_save_all_records(url, csv_filename="endfield_gacha_history_all.csv"):
+def fetch_and_save_all_records(url, csv_filename="endfield_gacha_history_all.csv", custom_uid=None, custom_alias=None):
     if not url: return False
     
     parsed_url = urlparse(url)
@@ -165,46 +167,249 @@ def fetch_and_save_all_records(url, csv_filename="endfield_gacha_history_all.csv
         deduped = []
         for record in all_records:
             sid = record.get('seqId')
-            # weaponId 유무로 타입 구분 후 복합 키 생성
+            pid = record.get('poolId', '')
             record_type = 'weap' if record.get('weaponId') else 'char'
-            key = (record_type, sid)
+            key = (record_type, pid, sid)
             if key not in seen_seq:
                 seen_seq.add(key)
-                deduped.append(record)
+            # gachaTs 값을 읽기 쉬운 시간 포맷(gachaTime)으로 변환하여 추가
+            if 'gachaTs' in record:
+                try:
+                    ts_sec = int(record['gachaTs']) // 1000
+                    record['gachaTime'] = datetime.fromtimestamp(ts_sec).strftime('%Y-%m-%d %H:%M:%S')
+                except (ValueError, TypeError):
+                    pass
+            deduped.append(record)
         all_records = deduped
-        with open(csv_filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
-            all_keys = []
-            for record in all_records:
-                for key in record.keys():
-                    if key not in all_keys: all_keys.append(key)
+
+        # 추출한 데이터 중에서 첫 번째 레코드의 uid를 가져옵니다.
+        # 동일한 token으로 조회했으므로 모든 레코드의 uid는 동일합니다.
+        if custom_uid:
+            account_uid = custom_uid
+        else:
+            account_uid = all_records[0].get('uid', 'unknown') if all_records else 'unknown'
+        
+        account_alias = custom_alias if custom_alias else ''
+
+        # SQLite 데이터베이스에 누적 저장 후 전체 데이터를 CSV로 내보내기
+        db_filename = "endfield_gacha_history.db"
+        all_keys = []
+        for record in all_records:
+            for key in record.keys():
+                if key not in all_keys: all_keys.append(key)
+        if 'uid' not in all_keys: all_keys.append('uid')
+        if 'alias' not in all_keys: all_keys.append('alias')
+
+        try:
+            conn = sqlite3.connect(db_filename)
+            cursor = conn.cursor()
+        
+            # 테이블 컬럼 검사 및 구조 변경(Migration)
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='gacha_records'")
+            table_exists = cursor.fetchone()
+        
+            if not table_exists:
+                cols_def = [f"{k} TEXT" for k in all_keys]
+                cols_def.append("PRIMARY KEY (uid, poolId, seqId)")
+                cursor.execute(f"CREATE TABLE gacha_records ({', '.join(cols_def)})")
+            else:
+                cursor.execute("PRAGMA table_info(gacha_records)")
+                existing_cols_info = cursor.fetchall()
+                existing_cols = [col[1] for col in existing_cols_info]
             
-            writer = csv.DictWriter(csvfile, fieldnames=all_keys)
-            writer.writeheader()
-            for row in all_records: writer.writerow(row)
-        print(f"\n🎉 총 {len(all_records)}개의 가챠 기록을 '{csv_filename}'에 저장했습니다!\n")
+                # PK를 변경하는 Migration
+                pks = [col[1] for col in existing_cols_info if col[5] > 0]
+                if sorted(pks) != ['poolId', 'seqId', 'uid']:
+                    temp_cols = [f"{k} TEXT" for k in existing_cols]
+                    temp_cols.append("PRIMARY KEY (uid, poolId, seqId)")
+                    cursor.execute(f"CREATE TABLE gacha_records_temp ({', '.join(temp_cols)})")
+                    cursor.execute("INSERT OR IGNORE INTO gacha_records_temp SELECT * FROM gacha_records")
+                    cursor.execute("DROP TABLE gacha_records")
+                    cursor.execute("ALTER TABLE gacha_records_temp RENAME TO gacha_records")
+            
+                # 새 컬럼이 있으면 추가
+                cursor.execute("PRAGMA table_info(gacha_records)")
+                current_cols = [col[1] for col in cursor.fetchall()]
+                for key in all_keys:
+                    if key not in current_cols:
+                        cursor.execute(f"ALTER TABLE gacha_records ADD COLUMN {key} TEXT")
+        
+            # 모든 대상 컬럼 다시 가져오기
+            cursor.execute("PRAGMA table_info(gacha_records)")
+            final_cols = [col[1] for col in cursor.fetchall()]
+        
+            # 새로 가져온 데이터 INSERT
+            placeholders = ", ".join(["?" for _ in final_cols])
+            insert_query = f"INSERT OR REPLACE INTO gacha_records ({', '.join(final_cols)}) VALUES ({placeholders})"
+        
+            for row in all_records:
+                row['uid'] = account_uid
+                row['alias'] = account_alias
+                values = [str(row.get(key, '')) for key in final_cols]
+                cursor.execute(insert_query, values)
+            
+            conn.commit()
+        
+            # DB에서 누적 전체 데이터 로드
+            cursor.execute("SELECT * FROM gacha_records ORDER BY gachaTs ASC, seqId ASC")
+            db_rows = cursor.fetchall()
+        
+            cumulative_records = []
+            for db_row in db_rows:
+                cumulative_records.append(dict(zip(final_cols, db_row)))
+            
+            conn.close()
+            print(f"\n📦 DB 누적 완료! 전체 데이터 통합: {len(cumulative_records)}개")
+
+            # 누적 데이터를 바탕으로 CSV 저장
+            with open(csv_filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=final_cols)
+                writer.writeheader()
+                for row in cumulative_records: 
+                    writer.writerow(row)
+            print(f"🎉 총 {len(cumulative_records)}개의 데이터를 '{csv_filename}' (CSV)에 통합 저장했습니다!\n")
+
+        except Exception as e:
+            print(f"❌ 데이터베이스 처리 중 오류 발생: {e}\n")
+            return False
+
         return True
+
     else:
         print("📭 저장할 가챠 기록이 없거나 토큰이 만료되었습니다. 게임에서 기록 창을 닫았다가 다시 열어주세요.")
         return False
 
-# 저장된 CSV 데이터를 바탕으로 천장 및 획득 확률을 분석합니다.
-def analyze_gacha_luck(csv_filename="endfield_gacha_history_all.csv"):
+# DB에서 계정 목록을 불러와 사용자가 선택하게 합니다.
+def select_account_from_db(db_filename="endfield_gacha_history.db"):
+    if not os.path.exists(db_filename):
+        return None
+        
+    try:
+        conn = sqlite3.connect(db_filename)
+        cursor = conn.cursor()
+        
+        cursor.execute("PRAGMA table_info(gacha_records)")
+        cols = [col[1] for col in cursor.fetchall()]
+        has_alias = 'alias' in cols
+        
+        if has_alias:
+            cursor.execute("SELECT DISTINCT uid, alias FROM gacha_records WHERE uid IS NOT NULL AND uid != 'unknown'")
+            rows = cursor.fetchall()
+            accounts = [(row[0], row[1]) for row in rows]
+        else:
+            cursor.execute("SELECT DISTINCT uid FROM gacha_records WHERE uid IS NOT NULL AND uid != 'unknown'")
+            rows = cursor.fetchall()
+            accounts = [(row[0], '') for row in rows]
+            
+        conn.close()
+        
+        if not accounts: return None
+        if len(accounts) == 1: return accounts[0][0]
+        
+        if platform.system() == "Windows":
+            import msvcrt
+            selected = 0
+            while True:
+                os.system('cls')
+                print("\n" + "=" * 45)
+                print("📁 조회할 계정을 방향키(↑/↓)나 W/S로 선택하고 Enter를 누르세요.")
+                print("=" * 45)
+                for i, acc in enumerate(accounts):
+                    uid_str = acc[0]
+                    alias_str = f" ({acc[1]})" if acc[1] else ""
+                    if i == selected:
+                        print(f"  ▶ [{i+1}] UID: {uid_str}{alias_str} (선택됨)")
+                    else:
+                        print(f"    [{i+1}] UID: {uid_str}{alias_str}")
+                
+                key = msvcrt.getch()
+                if key in (b'\xe0', b'\x00'): # 방향키
+                    key = msvcrt.getch()
+                    if key == b'H': # 위
+                        selected = max(0, selected - 1)
+                    elif key == b'P': # 아래
+                        selected = min(len(accounts) - 1, selected + 1)
+                elif key.lower() == b'w':
+                    selected = max(0, selected - 1)
+                elif key.lower() == b's':
+                    selected = min(len(accounts) - 1, selected + 1)
+                elif key in (b'\r', b'\n'): # Enter
+                    os.system('cls')
+                    return accounts[selected][0]
+        else:
+            # 윈도우가 아닌 경우 기존 번호 입력 방식 유지
+            print("\n" + "=" * 45)
+            print("📁 저장된 계정 목록")
+            print("=" * 45)
+            for i, acc in enumerate(accounts):
+                uid_str = acc[0]
+                alias_str = f" ({acc[1]})" if acc[1] else ""
+                print(f"[{i+1}] UID: {uid_str}{alias_str}")
+                
+            while True:
+                try:
+                    choice = int(input(f"\n조회할 계정 번호를 선택하세요 (1-{len(accounts)}): "))
+                    if 1 <= choice <= len(accounts):
+                        return accounts[choice-1][0]
+                    else:
+                        print("잘못된 번호입니다. 다시 입력해주세요.")
+                except ValueError:
+                    print("숫자를 입력해주세요.")
+    except Exception as e:
+        print(f"❌ 데이터베이스 읽기 오류: {e}")
+        return None
+
+# 저장된 DB 데이터를 바탕으로 천장 및 획득 확률을 분석합니다.
+def analyze_gacha_luck(target_uid=None, db_filename="endfield_gacha_history.db", csv_fallback="endfield_gacha_history_all.csv"):
     char_pulls = []
     weap_pulls = []
     
-    try:
-        with open(csv_filename, 'r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
-            rows = sorted(list(reader), key=lambda x: (int(x.get('gachaTs', 0)), int(x.get('seqId', 0))))
-    except FileNotFoundError:
-        print(f"❌ 오류: '{csv_filename}' 파일을 찾을 수 없습니다.")
+    rows = []
+    
+    # 1. DB에서 먼저 데이터를 읽어옵니다.
+    if os.path.exists(db_filename):
+        try:
+            conn = sqlite3.connect(db_filename)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            if target_uid:
+                cursor.execute("SELECT * FROM gacha_records WHERE uid = ? ORDER BY CAST(gachaTs AS INTEGER) ASC, CAST(seqId AS INTEGER) ASC", (target_uid,))
+            else:
+                cursor.execute("SELECT * FROM gacha_records ORDER BY CAST(gachaTs AS INTEGER) ASC, CAST(seqId AS INTEGER) ASC")
+                
+            db_rows = cursor.fetchall()
+            rows = [dict(row) for row in db_rows]
+            conn.close()
+            print(f"📥 데이터베이스에서 {'UID: '+target_uid if target_uid else '전체'} 기록 {len(rows)}개를 성공적으로 불러왔습니다.")
+        except Exception as e:
+            print(f"❌ 데이터베이스 읽기 오류: {e}. CSV 파일에서 읽기를 시도합니다.")
+    
+    # 2. DB에 데이터가 없거나 실패한 경우 기존 방식대로 CSV에서 읽어옵니다.
+    if not rows:
+        try:
+            with open(csv_fallback, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                rows = sorted(list(reader), key=lambda x: (int(x.get('gachaTs', 0)), int(x.get('seqId', 0))))
+                
+                # CSV에서 읽을 때 UID 필터링 (CSV에 uid 컬럼이 있는 경우)
+                if target_uid and rows and 'uid' in rows[0]:
+                    rows = [r for r in rows if r.get('uid') == target_uid]
+                    
+            print(f"📥 CSV 파일에서 기록을 불러왔습니다.")
+        except FileNotFoundError:
+            print(f"❌ 오류: 기록을 찾을 수 없습니다. 게임을 실행해 새로운 기록을 먼저 갱신해주세요.")
+            return
+
+    if not rows:
+        print("❌ 분석할 수 있는 뽑기 기록이 없습니다.")
         return
 
     for row in rows:
         rarity = int(row['rarity'])
         name = row.get('charName') if row.get('charName') else row.get('weaponName', '이름 없음')
         pool = row.get('poolName', '')
-        is_free = row.get('isFree') == 'True'
+        is_free = row.get('isFree') == 'True' or row.get('isFree') == '1' # DB에서 읽어올 때 문자열일 수 있음
         if row.get('weaponId'):
             weap_pulls.append({'name': name, 'rarity': rarity, 'pool': pool, 'is_free': is_free})
         else:
@@ -344,13 +549,29 @@ def analyze_gacha_luck(csv_filename="endfield_gacha_history_all.csv"):
     print("\n" + "=" * 45 + "\n")
 
 if __name__ == "__main__":
-    # 전체 실행 시간 측정을 시작합니다.
+    import sys
+    custom_uid = sys.argv[1] if len(sys.argv) > 1 else None
+    custom_alias = sys.argv[2] if len(sys.argv) > 2 else None
+
     start_time = time.time()
     
+    # 1. 온라인에서 새 데이터를 가져올 수 있는지 시도
     url = extract_gacha_url_from_log()
-    if fetch_and_save_all_records(url):
+    fetch_success = False
+    if url:
+        fetch_success = fetch_and_save_all_records(url, custom_uid=custom_uid, custom_alias=custom_alias)
+    
+    # 2. 계정 선택 및 분석 수행
+    # DB에서 여러 계정이 있는지 확인 (명령어로 지정한 경우 해당 계정 우선)
+    target_uid = custom_uid if custom_uid else select_account_from_db()
+    
+    if target_uid:
+        analyze_gacha_luck(target_uid=target_uid)
+    elif fetch_success:
+        # DB에 계정 정보가 없으나 방금 데이터를 가져왔다면 전체 데이터로 분석
         analyze_gacha_luck()
+    else:
+        print("\n💡 기록된 데이터가 없습니다. 게임을 실행해 가챠 기록 창을 먼저 열어주세요.")
         
-    # 측정을 종료하고 총 소요 시간을 출력합니다.
     end_time = time.time()
     print(f"⏱️ 총 실행 시간: {end_time - start_time:.2f}초")
