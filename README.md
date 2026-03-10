@@ -11,7 +11,8 @@ CLI 버전(`.py`)과 GUI 버전(`.exe`) 두 가지를 제공합니다.
 
 > GUI 버전 실행 화면
 
-![GUI 캐릭터 탭](screenshot_char.png)
+![GUI 캐릭터 탭](<img width="1100" height="804" alt="스크린샷 2026-03-10 143256" src="https://github.com/user-attachments/assets/8ba9b739-5058-4df0-b56e-f5689d59f33c" />
+)
 ![GUI 무기 탭](screenshot_weap.png)
 
 ---
@@ -170,3 +171,4 @@ urllib, csv, math, json ...
 ## 📜 라이선스
 
 MIT License
+
